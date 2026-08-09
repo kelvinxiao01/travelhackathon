@@ -13,7 +13,7 @@ interface Message {
 }
 
 interface SupplierOffer {
-  supplier: str;
+  supplier: string;
   price: number;
   booking_url: string;
 }
