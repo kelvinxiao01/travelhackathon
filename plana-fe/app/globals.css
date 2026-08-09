@@ -1106,6 +1106,125 @@ button:disabled {
   }
 }
 
+.voice-diagnostics {
+  display: grid;
+  gap: 7px;
+  margin: 24px 0 0;
+  text-align: left;
+}
+
+.voice-diagnostic {
+  display: flex;
+  min-height: 50px;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid #e2dfd3;
+  border-radius: 13px;
+  background: rgba(255, 254, 249, 0.72);
+  padding: 8px 11px;
+  transition: border-color 160ms ease, background 160ms ease;
+}
+
+.voice-diagnostic.is-active {
+  border-color: #b9d5c0;
+  background: #eef7ef;
+}
+
+.voice-diagnostic-bars {
+  display: inline-flex;
+  width: 28px;
+  height: 25px;
+  flex: 0 0 28px;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  border-radius: 9px;
+  background: #ecebe3;
+}
+
+.voice-diagnostic-bars > span {
+  display: block;
+  width: 3px;
+  height: 7px;
+  border-radius: 999px;
+  background: #9a9d95;
+  transform-origin: center;
+}
+
+.voice-diagnostic.is-active .voice-diagnostic-bars {
+  background: #d8eadd;
+}
+
+.voice-diagnostic.is-active .voice-diagnostic-bars > span {
+  background: #37705a;
+  animation: voice-input-level 620ms ease-in-out infinite alternate;
+}
+
+.voice-diagnostic.is-active .voice-diagnostic-bars > span:nth-child(1) {
+  animation-delay: 80ms;
+}
+
+.voice-diagnostic.is-active .voice-diagnostic-bars > span:nth-child(2) {
+  animation-delay: 210ms;
+}
+
+.voice-diagnostic.is-active .voice-diagnostic-bars > span:nth-child(3) {
+  animation-delay: 150ms;
+}
+
+@keyframes voice-input-level {
+  from {
+    transform: scaleY(0.7);
+  }
+
+  to {
+    transform: scaleY(2.4);
+  }
+}
+
+.voice-diagnostic-dot {
+  width: 9px;
+  height: 9px;
+  flex: 0 0 9px;
+  margin-inline: 9px 10px;
+  border-radius: 50%;
+  background: #b4b5ac;
+  box-shadow: 0 0 0 4px #ecebe3;
+  transition: background 160ms ease, box-shadow 160ms ease;
+}
+
+.voice-diagnostic.is-active .voice-diagnostic-dot {
+  background: #4e9770;
+  box-shadow: 0 0 0 4px #d8eadd;
+}
+
+.voice-diagnostic-copy {
+  display: grid;
+  gap: 2px;
+}
+
+.voice-diagnostic-copy small {
+  color: var(--faint-ink);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.voice-diagnostic-copy strong {
+  color: #374238;
+  font-size: 12px;
+  font-weight: 720;
+}
+
+.voice-diagnostics-note {
+  margin: 3px 5px 0;
+  color: var(--muted-ink);
+  font-size: 11px;
+  line-height: 1.4;
+  text-align: center;
+}
+
 .voice-session-eyebrow {
   margin: 28px 0 7px;
   color: var(--sage-dark);

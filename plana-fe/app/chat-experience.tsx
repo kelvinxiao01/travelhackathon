@@ -15,6 +15,13 @@ type ChatRole = "assistant" | "user";
 
 type VoiceStatus = "idle" | "connecting" | "connected" | "error";
 
+type AgentActivity =
+  | "initializing"
+  | "idle"
+  | "listening"
+  | "thinking"
+  | "speaking";
+
 type VoiceTokenResponse = {
   participantToken: string;
   serverUrl: string;
@@ -215,6 +222,38 @@ function voiceErrorMessage(error: unknown): string {
   return "Plan A could not start a voice session. Please try again.";
 }
 
+function microphoneIsPublished(room: Room): boolean {
+  const publication = room.localParticipant.getTrackPublication(
+    Track.Source.Microphone,
+  );
+
+  return Boolean(
+    publication?.audioTrack &&
+      !publication.isMuted &&
+      !publication.isUpstreamPaused &&
+      publication.audioTrack.mediaStreamTrack.readyState === "live",
+  );
+}
+
+function isAgentActivity(value: string | undefined): value is AgentActivity {
+  return ["initializing", "idle", "listening", "thinking", "speaking"].includes(
+    value ?? "",
+  );
+}
+
+function currentAgentActivity(room: Room): AgentActivity | null {
+  const agent = Array.from(room.remoteParticipants.values()).find(
+    (participant) => participant.isAgent,
+  );
+
+  if (!agent) {
+    return null;
+  }
+
+  const state = agent.attributes["lk.agent.state"];
+  return isAgentActivity(state) ? state : "initializing";
+}
+
 export default function ChatExperience() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
@@ -223,6 +262,9 @@ export default function ChatExperience() {
   const [isRailCollapsed, setIsRailCollapsed] = useState(false);
   const [voiceStatus, setVoiceStatus] = useState<VoiceStatus>("idle");
   const [voiceError, setVoiceError] = useState<string | null>(null);
+  const [isMicrophonePublished, setIsMicrophonePublished] = useState(false);
+  const [isLiveKitHearingYou, setIsLiveKitHearingYou] = useState(false);
+  const [agentActivity, setAgentActivity] = useState<AgentActivity | null>(null);
   const messageSequence = useRef(0);
   const turnToken = useRef(0);
   const connectionAttempt = useRef(0);
@@ -259,11 +301,18 @@ export default function ChatExperience() {
     }
   }, []);
 
+  const resetVoiceDiagnostics = useCallback(() => {
+    setIsMicrophonePublished(false);
+    setIsLiveKitHearingYou(false);
+    setAgentActivity(null);
+  }, []);
+
   const stopVoiceSession = useCallback(async () => {
     connectionAttempt.current += 1;
     const room = roomRef.current;
     roomRef.current = null;
     clearRemoteAudio();
+    resetVoiceDiagnostics();
 
     try {
       await room?.disconnect();
@@ -271,7 +320,7 @@ export default function ChatExperience() {
       setVoiceError(null);
       setVoiceStatus("idle");
     }
-  }, [clearRemoteAudio]);
+  }, [clearRemoteAudio, resetVoiceDiagnostics]);
 
   const startVoiceSession = useCallback(async () => {
     if (roomRef.current || voiceStatus === "connecting") {
@@ -281,29 +330,92 @@ export default function ChatExperience() {
     const attempt = connectionAttempt.current + 1;
     connectionAttempt.current = attempt;
     setVoiceError(null);
+    resetVoiceDiagnostics();
     setVoiceStatus("connecting");
 
     let room: Room | null = null;
 
     try {
-      room = new Room({ adaptiveStream: true, dynacast: true });
-      roomRef.current = room;
-      room.on(RoomEvent.TrackSubscribed, attachRemoteAudio);
-      room.on(RoomEvent.TrackUnsubscribed, detachRemoteAudio);
-      room.on(RoomEvent.Disconnected, () => {
-        if (roomRef.current !== room) {
+      const voiceRoom = new Room({ adaptiveStream: true, dynacast: true });
+      room = voiceRoom;
+      roomRef.current = voiceRoom;
+
+      const updateMicrophoneState = () => {
+        if (roomRef.current === voiceRoom) {
+          setIsMicrophonePublished(microphoneIsPublished(voiceRoom));
+        }
+      };
+
+      const updateAgentActivity = () => {
+        if (roomRef.current === voiceRoom) {
+          setAgentActivity(currentAgentActivity(voiceRoom));
+        }
+      };
+
+      voiceRoom.on(RoomEvent.TrackSubscribed, attachRemoteAudio);
+      voiceRoom.on(RoomEvent.TrackUnsubscribed, detachRemoteAudio);
+      voiceRoom.on(RoomEvent.LocalTrackPublished, (publication) => {
+        if (publication.source === Track.Source.Microphone) {
+          updateMicrophoneState();
+        }
+      });
+      voiceRoom.on(RoomEvent.LocalTrackUnpublished, (publication) => {
+        if (publication.source === Track.Source.Microphone) {
+          updateMicrophoneState();
+        }
+      });
+      voiceRoom.on(RoomEvent.TrackMuted, (publication, participant) => {
+        if (
+          participant.isLocal &&
+          publication.source === Track.Source.Microphone
+        ) {
+          updateMicrophoneState();
+        }
+      });
+      voiceRoom.on(RoomEvent.TrackUnmuted, (publication, participant) => {
+        if (
+          participant.isLocal &&
+          publication.source === Track.Source.Microphone
+        ) {
+          updateMicrophoneState();
+        }
+      });
+      voiceRoom.on(RoomEvent.ActiveSpeakersChanged, (speakers) => {
+        if (roomRef.current !== voiceRoom) {
+          return;
+        }
+
+        setIsLiveKitHearingYou(
+          speakers.some(
+            (participant) => participant.sid === voiceRoom.localParticipant.sid,
+          ),
+        );
+      });
+      voiceRoom.on(RoomEvent.ParticipantConnected, updateAgentActivity);
+      voiceRoom.on(RoomEvent.ParticipantDisconnected, updateAgentActivity);
+      voiceRoom.on(
+        RoomEvent.ParticipantAttributesChanged,
+        (_changedAttributes, participant) => {
+          if (participant.isAgent) {
+            updateAgentActivity();
+          }
+        },
+      );
+      voiceRoom.on(RoomEvent.Disconnected, () => {
+        if (roomRef.current !== voiceRoom) {
           return;
         }
 
         roomRef.current = null;
         clearRemoteAudio();
+        resetVoiceDiagnostics();
         setVoiceError(null);
         setVoiceStatus("idle");
       });
 
       // Invoke this before the first await so the click that starts the session also
       // unlocks browser audio playback on platforms with strict autoplay policies.
-      const unlockAudio = room.startAudio();
+      const unlockAudio = voiceRoom.startAudio();
       void unlockAudio.catch(() => undefined);
 
       const { participantToken, serverUrl } = await requestVoiceToken();
@@ -311,19 +423,22 @@ export default function ChatExperience() {
         return;
       }
 
-      await room.connect(serverUrl, participantToken);
+      await voiceRoom.connect(serverUrl, participantToken);
       if (connectionAttempt.current !== attempt) {
         roomRef.current = null;
-        await room.disconnect();
+        await voiceRoom.disconnect();
         return;
       }
 
       await unlockAudio;
-      await room.localParticipant.setMicrophoneEnabled(true);
+      await voiceRoom.localParticipant.setMicrophoneEnabled(true);
+
+      updateMicrophoneState();
+      updateAgentActivity();
 
       if (connectionAttempt.current !== attempt) {
         roomRef.current = null;
-        await room.disconnect();
+        await voiceRoom.disconnect();
         return;
       }
 
@@ -338,10 +453,17 @@ export default function ChatExperience() {
         await room.disconnect();
       }
       clearRemoteAudio();
+      resetVoiceDiagnostics();
       setVoiceError(voiceErrorMessage(error));
       setVoiceStatus("error");
     }
-  }, [attachRemoteAudio, clearRemoteAudio, detachRemoteAudio, voiceStatus]);
+  }, [
+    attachRemoteAudio,
+    clearRemoteAudio,
+    detachRemoteAudio,
+    resetVoiceDiagnostics,
+    voiceStatus,
+  ]);
 
   const handleAgentClick = () => {
     if (voiceStatus === "connected") {
@@ -358,6 +480,40 @@ export default function ChatExperience() {
       : voiceStatus === "connecting"
         ? "Connecting to Plan A"
         : "Talk to Plan A";
+
+  const microphoneStatus = isLiveKitHearingYou
+    ? "LiveKit detects your voice"
+    : isMicrophonePublished
+      ? "Mic on — say a few words"
+      : "Connecting microphone…";
+
+  const planAStatus =
+    agentActivity === "thinking"
+      ? "Processing what you said"
+      : agentActivity === "speaking"
+        ? "Speaking"
+        : agentActivity === "listening"
+          ? "Listening"
+          : agentActivity === "idle"
+            ? "Ready"
+            : agentActivity === "initializing"
+              ? "Getting ready…"
+              : "Joining the room…";
+
+  const isPlanAActive =
+    agentActivity === "listening" ||
+    agentActivity === "thinking" ||
+    agentActivity === "speaking";
+
+  const voiceDiagnosticNote = isLiveKitHearingYou
+    ? agentActivity === "thinking"
+      ? "Plan A is processing the turn it just received."
+      : agentActivity === "listening"
+        ? "LiveKit detects your voice and Plan A is listening."
+        : "Your voice is reaching the LiveKit room."
+    : isMicrophonePublished
+      ? "The indicator turns green when LiveKit detects you speaking."
+      : "Waiting for your microphone to finish connecting.";
 
   useEffect(() => {
     return () => {
@@ -741,6 +897,37 @@ export default function ChatExperience() {
               <span />
               <span />
             </span>
+            {voiceStatus === "connected" && (
+              <div className="voice-diagnostics" aria-live="polite">
+                <div
+                  className={`voice-diagnostic${
+                    isLiveKitHearingYou ? " is-active" : ""
+                  }`}
+                >
+                  <span className="voice-diagnostic-bars" aria-hidden="true">
+                    <span />
+                    <span />
+                    <span />
+                  </span>
+                  <span className="voice-diagnostic-copy">
+                    <small>Microphone</small>
+                    <strong>{microphoneStatus}</strong>
+                  </span>
+                </div>
+                <div
+                  className={`voice-diagnostic${
+                    isPlanAActive ? " is-active" : ""
+                  }`}
+                >
+                  <span className="voice-diagnostic-dot" aria-hidden="true" />
+                  <span className="voice-diagnostic-copy">
+                    <small>Plan A</small>
+                    <strong>{planAStatus}</strong>
+                  </span>
+                </div>
+                <p className="voice-diagnostics-note">{voiceDiagnosticNote}</p>
+              </div>
+            )}
             <p className="voice-session-eyebrow">Plan A voice</p>
             <h2 id="voice-session-title">
               {voiceStatus === "connected" ? "You’re talking with Plan A" : "Meet Plan A"}
