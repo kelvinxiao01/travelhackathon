@@ -6,18 +6,17 @@
 
 A complete starter project for building voice AI apps with [LiveKit Agents for Python](https://github.com/livekit/agents) and [LiveKit Cloud](https://cloud.livekit.io/).
 
-The starter project includes:
+This project is configured for a direct Gemini Live connection: LiveKit carries the
+browser's realtime audio and dispatches the agent, while the Python worker connects
+to Google's Gemini API with `GOOGLE_API_KEY`. It does not use LiveKit Inference for
+speech-to-text, language-model, or text-to-speech processing.
 
-- A simple voice AI assistant, ready for extension and customization
-- A voice AI pipeline built on [LiveKit Inference](https://docs.livekit.io/agents/models/inference), providing zero-configuration access to [models](https://docs.livekit.io/agents/models) from top labs
-  - Uses the fast, open-weight Gemma 4 31B model, [hosted by LiveKit](https://docs.livekit.io/agents/models/llm/livekit/) and tuned for optimal performance in voice AI, as the default LLM
-  - Supports more than 50 models from OpenAI, Cartesia, Deepgram, and other providers
-  - Access to a wide range of other models, including [Realtime models](https://docs.livekit.io/agents/models/realtime), through extensive plugin ecosystem
-- Eval suite based on the LiveKit Agents [testing & evaluation framework](https://docs.livekit.io/agents/start/testing/)
-- [LiveKit Turn Detector](https://docs.livekit.io/agents/logic/turns/turn-detector/), an end-of-turn model that listens to the user's audio directly, combining semantic understanding with acoustic cues for state-of-the-art accuracy across 14 languages
-- [Background voice cancellation](https://docs.livekit.io/transport/media/noise-cancellation/)
-- Deep session insights from LiveKit [Agent Observability](https://docs.livekit.io/deploy/observability/)
-- A Dockerfile ready for [production deployment to LiveKit Cloud](https://docs.livekit.io/deploy/agents/)
+The project includes:
+
+- A Plan A voice agent using Gemini Live's native audio input, output, and turn detection.
+- A focused test suite that checks the direct-provider configuration without calling a
+  live model.
+- A Dockerfile ready for [production deployment to LiveKit Cloud](https://docs.livekit.io/deploy/agents/).
 
 This starter app is compatible with any [custom web/mobile frontend](https://docs.livekit.io/frontends/) or [telephony](https://docs.livekit.io/telephony/).
 
@@ -57,6 +56,20 @@ See the [Using coding agents](https://docs.livekit.io/intro/coding-agents/) guid
 The project includes a complete [AGENTS.md](AGENTS.md) file for these assistants. You can modify this file to suit your needs. To learn more about this file, see [https://agents.md](https://agents.md).
 
 ## Dev Setup
+
+### Gemini Live configuration
+
+Copy `.env.example` to `.env.local` and set all of the following values:
+
+- `LIVEKIT_URL`, `LIVEKIT_API_KEY`, and `LIVEKIT_API_SECRET` for the LiveKit room
+  and agent worker.
+- `GOOGLE_API_KEY` for the direct Gemini Live connection. Keep this key in the
+  Python worker's environment only; do not add it to the frontend.
+- Optionally, set `GEMINI_LIVE_MODEL` and `GEMINI_LIVE_VOICE` to override the
+  default native-audio model and voice.
+
+When deploying the worker, configure `GOOGLE_API_KEY` as a worker secret alongside
+the LiveKit credentials.
 
 Create a project from this template with the LiveKit CLI (recommended):
 

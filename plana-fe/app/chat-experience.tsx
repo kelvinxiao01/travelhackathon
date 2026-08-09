@@ -4,11 +4,21 @@ import {
   type FormEvent,
   type KeyboardEvent,
   type ReactNode,
+  useCallback,
+  useEffect,
   useRef,
   useState,
 } from "react";
+import { Room, RoomEvent, Track, type RemoteTrack } from "livekit-client";
 
 type ChatRole = "assistant" | "user";
+
+type VoiceStatus = "idle" | "connecting" | "connected" | "error";
+
+type VoiceTokenResponse = {
+  participantToken: string;
+  serverUrl: string;
+};
 
 type ChatMessage = {
   id: number;
@@ -34,6 +44,7 @@ type IconName =
   | "close"
   | "compass"
   | "menu"
+  | "mic"
   | "route"
   | "send"
   | "spark"
@@ -143,6 +154,7 @@ const iconPaths: Record<IconName, ReactNode> = {
   close: <path d="m6 6 12 12M18 6 6 18" />,
   compass: <><circle cx="12" cy="12" r="9" /><path d="m15.5 8.5-2.3 4.7-4.7 2.3 2.3-4.7 4.7-2.3Z" /></>,
   menu: <path d="M4 7h16M4 12h16M4 17h16" />,
+  mic: <><rect x="9" y="3" width="6" height="11" rx="3" /><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21M8.5 21h7" /></>,
   route: <><circle cx="6" cy="18" r="2" /><circle cx="18" cy="6" r="2" /><path d="M8 18c5 0 1-8 8-8M8 8c2.5 0 4-2 4-4" /></>,
   send: <path d="m21 3-7.5 18-3.2-7.3L3 10.5 21 3ZM10.3 13.7 15 9" />,
   spark: <path d="m12 3 1.5 5.4L19 10l-5.5 1.6L12 17l-1.5-5.4L5 10l5.5-1.6L12 3ZM19 16l.6 2.4L22 19l-2.4.6L19 22l-.6-2.4L16 19l2.4-.6L19 16Z" />,
@@ -175,14 +187,187 @@ function BrandMark({ compact = false }: { compact?: boolean }) {
   );
 }
 
+async function requestVoiceToken(): Promise<VoiceTokenResponse> {
+  const response = await fetch("/api/livekit/token", { method: "POST" });
+  const body = (await response.json()) as Partial<VoiceTokenResponse> & {
+    error?: string;
+  };
+
+  if (!response.ok || !body.participantToken || !body.serverUrl) {
+    throw new Error(body.error ?? "Plan A could not start a voice session.");
+  }
+
+  return {
+    participantToken: body.participantToken,
+    serverUrl: body.serverUrl,
+  };
+}
+
+function voiceErrorMessage(error: unknown): string {
+  if (error instanceof DOMException && error.name === "NotAllowedError") {
+    return "Microphone access was blocked. Allow it in your browser, then try again.";
+  }
+
+  if (error instanceof Error && error.message) {
+    return error.message;
+  }
+
+  return "Plan A could not start a voice session. Please try again.";
+}
+
 export default function ChatExperience() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [isThinking, setIsThinking] = useState(false);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [isRailCollapsed, setIsRailCollapsed] = useState(false);
+  const [voiceStatus, setVoiceStatus] = useState<VoiceStatus>("idle");
+  const [voiceError, setVoiceError] = useState<string | null>(null);
   const messageSequence = useRef(0);
   const turnToken = useRef(0);
+  const connectionAttempt = useRef(0);
+  const roomRef = useRef<Room | null>(null);
+  const remoteAudioElements = useRef(new Set<HTMLMediaElement>());
+
+  const clearRemoteAudio = useCallback(() => {
+    for (const audioElement of remoteAudioElements.current) {
+      audioElement.remove();
+    }
+    remoteAudioElements.current.clear();
+  }, []);
+
+  const attachRemoteAudio = useCallback((track: RemoteTrack) => {
+    if (track.kind !== Track.Kind.Audio) {
+      return;
+    }
+
+    const audioElement = track.attach();
+    audioElement.autoplay = true;
+    audioElement.setAttribute("data-livekit-audio", "true");
+    document.body.appendChild(audioElement);
+    remoteAudioElements.current.add(audioElement);
+  }, []);
+
+  const detachRemoteAudio = useCallback((track: RemoteTrack) => {
+    if (track.kind !== Track.Kind.Audio) {
+      return;
+    }
+
+    for (const audioElement of track.detach()) {
+      audioElement.remove();
+      remoteAudioElements.current.delete(audioElement);
+    }
+  }, []);
+
+  const stopVoiceSession = useCallback(async () => {
+    connectionAttempt.current += 1;
+    const room = roomRef.current;
+    roomRef.current = null;
+    clearRemoteAudio();
+
+    try {
+      await room?.disconnect();
+    } finally {
+      setVoiceError(null);
+      setVoiceStatus("idle");
+    }
+  }, [clearRemoteAudio]);
+
+  const startVoiceSession = useCallback(async () => {
+    if (roomRef.current || voiceStatus === "connecting") {
+      return;
+    }
+
+    const attempt = connectionAttempt.current + 1;
+    connectionAttempt.current = attempt;
+    setVoiceError(null);
+    setVoiceStatus("connecting");
+
+    let room: Room | null = null;
+
+    try {
+      room = new Room({ adaptiveStream: true, dynacast: true });
+      roomRef.current = room;
+      room.on(RoomEvent.TrackSubscribed, attachRemoteAudio);
+      room.on(RoomEvent.TrackUnsubscribed, detachRemoteAudio);
+      room.on(RoomEvent.Disconnected, () => {
+        if (roomRef.current !== room) {
+          return;
+        }
+
+        roomRef.current = null;
+        clearRemoteAudio();
+        setVoiceError(null);
+        setVoiceStatus("idle");
+      });
+
+      // Invoke this before the first await so the click that starts the session also
+      // unlocks browser audio playback on platforms with strict autoplay policies.
+      const unlockAudio = room.startAudio();
+      void unlockAudio.catch(() => undefined);
+
+      const { participantToken, serverUrl } = await requestVoiceToken();
+      if (connectionAttempt.current !== attempt) {
+        return;
+      }
+
+      await room.connect(serverUrl, participantToken);
+      if (connectionAttempt.current !== attempt) {
+        roomRef.current = null;
+        await room.disconnect();
+        return;
+      }
+
+      await unlockAudio;
+      await room.localParticipant.setMicrophoneEnabled(true);
+
+      if (connectionAttempt.current !== attempt) {
+        roomRef.current = null;
+        await room.disconnect();
+        return;
+      }
+
+      setVoiceStatus("connected");
+    } catch (error) {
+      if (connectionAttempt.current !== attempt) {
+        return;
+      }
+
+      if (room && roomRef.current === room) {
+        roomRef.current = null;
+        await room.disconnect();
+      }
+      clearRemoteAudio();
+      setVoiceError(voiceErrorMessage(error));
+      setVoiceStatus("error");
+    }
+  }, [attachRemoteAudio, clearRemoteAudio, detachRemoteAudio, voiceStatus]);
+
+  const handleAgentClick = () => {
+    if (voiceStatus === "connected") {
+      void stopVoiceSession();
+      return;
+    }
+
+    void startVoiceSession();
+  };
+
+  const voiceButtonLabel =
+    voiceStatus === "connected"
+      ? "End voice session"
+      : voiceStatus === "connecting"
+        ? "Connecting to Plan A"
+        : "Talk to Plan A";
+
+  useEffect(() => {
+    return () => {
+      connectionAttempt.current += 1;
+      const room = roomRef.current;
+      roomRef.current = null;
+      clearRemoteAudio();
+      void room?.disconnect();
+    };
+  }, [clearRemoteAudio]);
 
   const createMessageId = () => {
     messageSequence.current += 1;
@@ -299,14 +484,27 @@ export default function ChatExperience() {
           </p>
         </div>
 
-        <div className="sidebar-footer">
+        <button
+          aria-label={voiceButtonLabel}
+          aria-pressed={voiceStatus === "connected"}
+          className={`sidebar-footer agent-launcher${
+            voiceStatus === "connected" ? " is-live" : ""
+          }`}
+          disabled={voiceStatus === "connecting"}
+          onClick={handleAgentClick}
+          type="button"
+        >
           <span className="avatar avatar--plan">P</span>
           <span className="sidebar-copy sidebar-footer-copy">
             <strong>Plan A</strong>
-            <small>Your travel sidekick</small>
+            <small>
+              {voiceStatus === "connected"
+                ? "Voice session live"
+                : "Your travel sidekick"}
+            </small>
           </span>
-          <span className="online-dot" aria-label="Ready to plan" />
-        </div>
+          <span className="online-dot" aria-hidden="true" />
+        </button>
       </aside>
 
       {isSidebarOpen && (
@@ -343,10 +541,21 @@ export default function ChatExperience() {
             </div>
           </div>
           <div className="header-actions">
-            <span className="assistant-status">
+            <button
+              aria-label={voiceButtonLabel}
+              aria-pressed={voiceStatus === "connected"}
+              className="assistant-status assistant-status-button"
+              disabled={voiceStatus === "connecting"}
+              onClick={handleAgentClick}
+              type="button"
+            >
               <span />
-              Ready when you are
-            </span>
+              {voiceStatus === "connected"
+                ? "Voice session live"
+                : voiceStatus === "connecting"
+                  ? "Connecting…"
+                  : "Talk to Plan A"}
+            </button>
             <button className="more-button" onClick={startNewChat} type="button" aria-label="Start a new conversation">
               <Icon name="add" />
             </button>
@@ -365,6 +574,19 @@ export default function ChatExperience() {
                 Tell Plan A where you’re dreaming of, when you can get away, and
                 what you want the trip to feel like.
               </p>
+              <button
+                className={`voice-launch-button${
+                  voiceStatus === "connected" ? " is-live" : ""
+                }`}
+                disabled={voiceStatus === "connecting"}
+                onClick={handleAgentClick}
+                type="button"
+              >
+                <span className="voice-launch-icon">
+                  <Icon name="mic" size={18} />
+                </span>
+                <span>{voiceButtonLabel}</span>
+              </button>
               <div className="suggestion-grid" aria-label="Suggested prompts">
                 {starterIdeas.map((idea) => (
                   <button
@@ -497,6 +719,59 @@ export default function ChatExperience() {
           </p>
         </div>
       </section>
+
+      {voiceStatus !== "idle" && (
+        <div className="voice-session-backdrop">
+          <section
+            aria-labelledby="voice-session-title"
+            aria-modal="true"
+            className="voice-session-card"
+            role="dialog"
+          >
+            <button
+              aria-label="Close voice session"
+              className="voice-session-close"
+              onClick={() => void stopVoiceSession()}
+              type="button"
+            >
+              <Icon name="close" />
+            </button>
+            <span className={`voice-orb voice-orb--${voiceStatus}`} aria-hidden="true">
+              <span />
+              <span />
+              <span />
+            </span>
+            <p className="voice-session-eyebrow">Plan A voice</p>
+            <h2 id="voice-session-title">
+              {voiceStatus === "connected" ? "You’re talking with Plan A" : "Meet Plan A"}
+            </h2>
+            <p aria-live="polite" className="voice-session-status">
+              {voiceStatus === "connecting"
+                ? "Connecting your microphone and bringing Plan A into the room…"
+                : voiceStatus === "connected"
+                  ? voiceError ?? "You’re live. Say hello whenever you’re ready."
+                  : voiceError}
+            </p>
+            {voiceStatus === "error" ? (
+              <button
+                className="voice-session-action"
+                onClick={() => void startVoiceSession()}
+                type="button"
+              >
+                Try again
+              </button>
+            ) : (
+              <button
+                className="voice-session-action voice-session-action--secondary"
+                onClick={() => void stopVoiceSession()}
+                type="button"
+              >
+                End voice session
+              </button>
+            )}
+          </section>
+        </div>
+      )}
     </div>
   );
 }
