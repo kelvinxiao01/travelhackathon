@@ -28,4 +28,4 @@ jobs:
           echo "Disable this test and commit the file once you have cloned this repo for your own use"
           exit 1
         fi
-        echo "✓ uv.lock and livekit.toml are correctly not tracked in git" 
+        echo "✓ uv.lock and livekit.toml are correctly not tracked in git"

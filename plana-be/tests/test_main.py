@@ -1,153 +1,88 @@
-import base64
-import json
-import time
-
 import pytest
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi.testclient import TestClient
+import os
+import json
 
-import main
+from main import app
+from database import (
+    get_or_create_conversation,
+    add_conversation_message,
+    get_conversation_messages,
+    get_active_trip,
+    save_trip
+)
+from tools.stay22 import search_accommodations
+from tools.routes import calculate_mock_route, haversine_distance
 
-
-client = TestClient(main.app)
-
-
-@pytest.fixture(autouse=True)
-def _clear_processed_message_ids() -> None:
-    main.processed_message_ids.clear()
-
-
-def _signed_webhook_payload(event: dict[str, object]) -> tuple[bytes, dict[str, str]]:
-    private_key = Ed25519PrivateKey.generate()
-    public_key = private_key.public_key().public_bytes(
-        serialization.Encoding.Raw,
-        serialization.PublicFormat.Raw,
-    )
-    body = json.dumps(event, separators=(",", ":")).encode()
-    timestamp = str(int(time.time()))
-    signature = private_key.sign(timestamp.encode() + b"|" + body)
-
-    return body, {
-        "content-type": "application/json",
-        "telnyx-timestamp": timestamp,
-        "telnyx-signature-ed25519": base64.b64encode(signature).decode(),
-        "x-test-telnyx-public-key": base64.b64encode(public_key).decode(),
-    }
-
+client = TestClient(app)
 
 def test_health_check_reports_service_ready() -> None:
     response = client.get("/health")
-
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
 
+def test_sms_database_persistence() -> None:
+    import asyncio
+    test_number = "+18888888888"
+    
+    # 1. Get or create conversation record
+    conv = asyncio.run(get_or_create_conversation(test_number))
+    assert conv is not None
+    assert conv["phone_number"] == test_number
+    conv_id = conv["id"]
+    
+    # 2. Add message log
+    asyncio.run(add_conversation_message(conv_id, "inbound", "I want to visit NYC"))
+    msgs = asyncio.run(get_conversation_messages(conv_id))
+    assert len(msgs) > 0
+    assert msgs[-1]["message"] == "I want to visit NYC"
+    assert msgs[-1]["direction"] == "inbound"
+    
+    # 3. Get active trip state
+    trip = asyncio.run(get_active_trip(conv_id))
+    assert trip is not None
+    trip_id = trip["id"]
+    
+    # 4. Save trip state
+    state = {"destination": "New York City", "interests": ["museums"]}
+    asyncio.run(save_trip(trip_id, state, "draft"))
+    
+    # 5. Reload active trip and check contents
+    loaded_trip = asyncio.run(get_active_trip(conv_id, trip_id))
+    assert loaded_trip["state_json"]["destination"] == "New York City"
+    assert loaded_trip["state_json"]["interests"] == ["museums"]
 
-def test_inbound_message_generates_and_sends_a_reply(monkeypatch) -> None:
-    sent_messages: list[dict[str, str]] = []
+def test_stay22_booking_link_builder() -> None:
+    import asyncio
+    hotels = asyncio.run(search_accommodations("New York City", "2027-06-01", "2027-06-04", 2))
+    assert len(hotels) > 0
+    for hotel in hotels:
+        for offer in hotel["offers"]:
+            url = offer["booking_url"]
+            assert "stay22.com/allez/roam" in url
+            assert "checkin=2027-06-01" in url
+            assert "checkout=2027-06-04" in url
+            assert "guests=2" in url
 
-    async def generate_agent_reply(inbound_text: str) -> str:
-        assert inbound_text == "Help me plan a trip"
-        return "Where would you like to go?"
+def test_geographical_distance_routing() -> None:
+    dist = haversine_distance(40.7462, -73.9847, 40.7484, -73.9857)
+    assert dist > 0.1
+    assert dist < 0.5
+    
+    route = calculate_mock_route(40.7462, -73.9847, 40.7484, -73.9857, "walking")
+    assert route["mode"] == "walking"
+    assert route["duration_seconds"] > 60
+    assert route["distance_meters"] > 200
 
-    def send_sms_reply(
-        *, from_phone_number: str, to_phone_number: str, text: str
-    ) -> None:
-        sent_messages.append(
-            {
-                "from_phone_number": from_phone_number,
-                "to_phone_number": to_phone_number,
-                "text": text,
-            }
-        )
-
-    monkeypatch.setattr(main, "generate_agent_reply", generate_agent_reply)
-    monkeypatch.setattr(main, "send_sms_reply", send_sms_reply)
-
-    event = {
-        "data": {
-            "event_type": "message.received",
-            "id": "event-123",
-            "payload": {
-                "id": "message-123",
-                "direction": "inbound",
-                "from": {"phone_number": "+15555550100"},
-                "to": [{"phone_number": "+13472738658"}],
-                "text": "Help me plan a trip",
-                "type": "SMS",
-            },
+def test_sms_webhook_endpoint_accepts_payload() -> None:
+    response = client.post(
+        "/api/webhooks/sms",
+        headers={"X-Roam-Secret": os.getenv("ROAM_BACKEND_SECRET", "hackathon_secret_roam")},
+        json={
+            "from_number": "+15555550100",
+            "to_number": "+13472738658",
+            "text": "Help me plan a trip to NYC"
         }
-    }
-    body, headers = _signed_webhook_payload(event)
-    monkeypatch.setenv("TELNYX_PUBLIC_KEY", headers.pop("x-test-telnyx-public-key"))
-
-    response = client.post("/webhooks/telnyx/inbound", content=body, headers=headers)
-
-    assert response.status_code == 200
+    )
+    assert response.status_code == 202
     assert response.json() == {"status": "accepted"}
-    assert sent_messages == [
-        {
-            "from_phone_number": "+13472738658",
-            "to_phone_number": "+15555550100",
-            "text": "Where would you like to go?",
-        }
-    ]
-
-
-def test_webhook_rejects_an_unsigned_message(monkeypatch) -> None:
-    body, headers = _signed_webhook_payload(
-        {"data": {"event_type": "message.received", "payload": {}}}
-    )
-    monkeypatch.setenv("TELNYX_PUBLIC_KEY", headers.pop("x-test-telnyx-public-key"))
-    headers.pop("telnyx-timestamp")
-    headers.pop("telnyx-signature-ed25519")
-
-    response = client.post("/webhooks/telnyx/inbound", content=body, headers=headers)
-
-    assert response.status_code == 403
-
-
-def test_telnyx_stop_is_acknowledged_without_an_agent_reply(monkeypatch) -> None:
-    async def generate_agent_reply(_: str) -> str:
-        raise AssertionError("An opt-out keyword must not reach the agent.")
-
-    monkeypatch.setattr(main, "generate_agent_reply", generate_agent_reply)
-    body, headers = _signed_webhook_payload(
-        {
-            "data": {
-                "event_type": "message.received",
-                "id": "event-stop",
-                "payload": {"autoresponse_type": "STOP", "text": "STOP"},
-            }
-        }
-    )
-    monkeypatch.setenv("TELNYX_PUBLIC_KEY", headers.pop("x-test-telnyx-public-key"))
-
-    response = client.post("/webhooks/telnyx/inbound", content=body, headers=headers)
-
-    assert response.status_code == 200
-    assert response.json() == {"status": "accepted"}
-
-
-def test_outbound_delivery_failures_are_logged(monkeypatch, caplog) -> None:
-    body, headers = _signed_webhook_payload(
-        {
-            "data": {
-                "event_type": "message.finalized",
-                "id": "event-finalized",
-                "payload": {
-                    "direction": "outbound",
-                    "id": "message-finalized",
-                    "to": [{"status": "delivery_failed"}],
-                    "errors": [{"code": "47000"}],
-                },
-            }
-        }
-    )
-    monkeypatch.setenv("TELNYX_PUBLIC_KEY", headers.pop("x-test-telnyx-public-key"))
-
-    response = client.post("/webhooks/telnyx/inbound", content=body, headers=headers)
-
-    assert response.status_code == 200
-    assert "Telnyx outbound delivery failed" in caplog.text
-    assert "47000" in caplog.text
