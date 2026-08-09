@@ -61,7 +61,9 @@ init_sqlite()
 def get_supabase_client() -> Tuple[Optional[str], Optional[Dict[str, str]]]:
     """Helper to get Supabase URL and headers if configured."""
     url = os.getenv("SUPABASE_URL")
-    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    # SUPABASE_SK is the existing backend-only name used in local deployments.
+    # Never fall back to the publishable key here: this client persists trips.
+    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_SK")
     if url and key:
         headers = {
             "apikey": key,
@@ -71,6 +73,40 @@ def get_supabase_client() -> Tuple[Optional[str], Optional[Dict[str, str]]]:
         }
         return url.rstrip("/"), headers
     return None, None
+
+
+async def get_conversation_by_phone_number(phone_number: str) -> Optional[Dict[str, Any]]:
+    """Retrieve a conversation without creating a new one.
+
+    Web trips use the historical ``phone_number`` column as a stable session key.
+    Voice callers must only read or edit an already-created session, never create a
+    blank trip as a side effect of opening a voice room.
+    """
+    url, headers = get_supabase_client()
+
+    if url and headers:
+        async with httpx.AsyncClient() as client:
+            try:
+                fetch_url = (
+                    f"{url}/rest/v1/conversations?phone_number=eq."
+                    f"{urllib.parse.quote(phone_number)}&limit=1"
+                )
+                response = await client.get(fetch_url, headers=headers)
+                response.raise_for_status()
+                conversations = response.json()
+                if conversations:
+                    return conversations[0]
+                return None
+            except Exception as error:
+                logger.error("Supabase conversation lookup error: %s", error)
+
+    conn = sqlite3.connect(SQLITE_DB)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM conversations WHERE phone_number = ?", (phone_number,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
 
 async def get_or_create_conversation(phone_number: str) -> Dict[str, Any]:
     """Retrieve or create a conversation record by phone number."""
@@ -203,6 +239,59 @@ async def add_conversation_message(conversation_id: str, direction: str, message
     )
     conn.commit()
     conn.close()
+
+
+async def get_existing_active_trip(
+    conversation_id: str,
+    active_trip_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Return an existing active trip without creating a draft as a side effect."""
+    url, headers = get_supabase_client()
+
+    if url and headers:
+        async with httpx.AsyncClient() as client:
+            try:
+                if active_trip_id:
+                    response = await client.get(
+                        f"{url}/rest/v1/trips?id=eq.{active_trip_id}",
+                        headers=headers,
+                    )
+                else:
+                    response = await client.get(
+                        f"{url}/rest/v1/trips?conversation_id=eq.{conversation_id}"
+                        "&order=updated_at.desc&limit=1",
+                        headers=headers,
+                    )
+                response.raise_for_status()
+                trips = response.json()
+                if trips:
+                    trip = trips[0]
+                    if isinstance(trip.get("state_json"), str):
+                        trip["state_json"] = json.loads(trip["state_json"])
+                    return trip
+                return None
+            except Exception as error:
+                logger.error("Supabase existing trip lookup error: %s", error)
+
+    conn = sqlite3.connect(SQLITE_DB)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    if active_trip_id:
+        cursor.execute("SELECT * FROM trips WHERE id = ?", (active_trip_id,))
+    else:
+        cursor.execute(
+            "SELECT * FROM trips WHERE conversation_id = ? ORDER BY updated_at DESC LIMIT 1",
+            (conversation_id,),
+        )
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return None
+
+    trip = dict(row)
+    trip["state_json"] = json.loads(trip["state_json"])
+    return trip
+
 
 async def get_active_trip(conversation_id: str, active_trip_id: Optional[str] = None) -> Dict[str, Any]:
     """Retrieve or create the active trip JSON state."""

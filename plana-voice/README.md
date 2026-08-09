@@ -71,6 +71,25 @@ Copy `.env.example` to `.env.local` and set all of the following values:
 When deploying the worker, configure `GOOGLE_API_KEY` as a worker secret alongside
 the LiveKit credentials.
 
+### Trip context and itinerary edits
+
+Plan A receives the current trip through a short-lived LiveKit room dispatch, then
+uses the existing `plana-be` LangGraph/Supabase backend to read and validate a
+requested itinerary change. The worker never receives a Supabase key.
+
+Set `PLANA_VOICE_AGENT_SECRET` to the same value in both `plana-be/.env` and the
+voice worker environment. Set `PLANA_BACKEND_URL` in the worker environment:
+
+- `PLANA_VOICE_AGENT_SECRET`: one shared, private server-to-server secret.
+- `PLANA_BACKEND_URL`: the worker-visible base URL for `plana-be` (for example,
+  `http://127.0.0.1:8000` during local development).
+
+Keep `SUPABASE_SERVICE_ROLE_KEY` (or the existing backend-only `SUPABASE_SK`)
+in `plana-be` only. When Plan A successfully reschedules an activity or meal, the
+backend saves it, validates it with the existing planning rules, and the worker sends
+a compact revision signal over the LiveKit room. The browser then refetches and
+renders the saved itinerary immediately without interrupting the voice room.
+
 ### Voice isolation
 
 The worker applies ai-coustics Voice Focus 2.1 S (`QUAIL_VF_S`) to incoming browser

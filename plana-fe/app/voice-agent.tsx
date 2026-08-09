@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Room, RoomEvent, Track, type RemoteTrack } from "livekit-client";
+import { useTripSession, type VoiceTripUpdate } from "./trip-session-context";
 
 type VoiceStatus = "idle" | "connecting" | "connected" | "error";
 
@@ -35,8 +36,14 @@ function CloseIcon() {
   );
 }
 
-async function requestVoiceToken(): Promise<VoiceTokenResponse> {
-  const response = await fetch("/api/livekit/token", { method: "POST" });
+async function requestVoiceToken(
+  sessionId: string,
+): Promise<VoiceTokenResponse> {
+  const response = await fetch("/api/livekit/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sessionId }),
+  });
   const body = (await response.json()) as Partial<VoiceTokenResponse> & {
     error?: string;
   };
@@ -82,7 +89,22 @@ function currentAgentActivity(room: Room): AgentActivity | null {
   return isAgentActivity(state) ? state : "initializing";
 }
 
+function isVoiceTripUpdate(value: unknown): value is VoiceTripUpdate {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+
+  const update = value as Record<string, unknown>;
+  return (
+    update.type === "trip.updated" &&
+    typeof update.sessionId === "string" &&
+    typeof update.revision === "number" &&
+    typeof update.summary === "string"
+  );
+}
+
 export default function VoiceAgent() {
+  const { sessionId, publishVoiceTripUpdate } = useTripSession();
   const [voiceStatus, setVoiceStatus] = useState<VoiceStatus>("idle");
   const [voiceError, setVoiceError] = useState<string | null>(null);
   const [hasMicrophoneTrack, setHasMicrophoneTrack] = useState(false);
@@ -90,6 +112,7 @@ export default function VoiceAgent() {
   const [isAgentSpeaking, setIsAgentSpeaking] = useState(false);
   const [agentActivity, setAgentActivity] = useState<AgentActivity | null>(null);
   const connectionAttempt = useRef(0);
+  const boundSessionId = useRef<string | null>(null);
   const roomRef = useRef<Room | null>(null);
   const remoteAudioElements = useRef(new Set<HTMLMediaElement>());
 
@@ -134,6 +157,7 @@ export default function VoiceAgent() {
     connectionAttempt.current += 1;
     const room = roomRef.current;
     roomRef.current = null;
+    boundSessionId.current = null;
     clearRemoteAudio();
     resetVoiceState();
 
@@ -149,9 +173,15 @@ export default function VoiceAgent() {
     if (roomRef.current || voiceStatus === "connecting") {
       return;
     }
+    if (!sessionId) {
+      setVoiceError("Start a trip in the planner before using voice edits.");
+      setVoiceStatus("error");
+      return;
+    }
 
     const attempt = connectionAttempt.current + 1;
     connectionAttempt.current = attempt;
+    boundSessionId.current = sessionId;
     setVoiceError(null);
     resetVoiceState();
     setVoiceStatus("connecting");
@@ -232,6 +262,27 @@ export default function VoiceAgent() {
       voiceRoom.on(RoomEvent.ParticipantConnected, syncAgentState);
       voiceRoom.on(RoomEvent.ParticipantDisconnected, syncAgentState);
       voiceRoom.on(
+        RoomEvent.DataReceived,
+        (payload, participant, _kind, topic) => {
+          if (
+            roomRef.current !== voiceRoom ||
+            !participant?.isAgent ||
+            topic !== "plana.trip.updated"
+          ) {
+            return;
+          }
+
+          try {
+            const update = JSON.parse(new TextDecoder().decode(payload)) as unknown;
+            if (isVoiceTripUpdate(update) && update.sessionId === sessionId) {
+              publishVoiceTripUpdate(update);
+            }
+          } catch {
+            // Ignore unrelated or malformed room data. Audio should remain usable.
+          }
+        },
+      );
+      voiceRoom.on(
         RoomEvent.ParticipantAttributesChanged,
         (_changedAttributes, participant) => {
           if (participant.isAgent) {
@@ -245,6 +296,7 @@ export default function VoiceAgent() {
         }
 
         roomRef.current = null;
+        boundSessionId.current = null;
         clearRemoteAudio();
         resetVoiceState();
         setVoiceError(null);
@@ -256,7 +308,7 @@ export default function VoiceAgent() {
       const unlockAudio = voiceRoom.startAudio();
       void unlockAudio.catch(() => undefined);
 
-      const { participantToken, serverUrl } = await requestVoiceToken();
+      const { participantToken, serverUrl } = await requestVoiceToken(sessionId);
       if (connectionAttempt.current !== attempt) {
         return;
       }
@@ -287,6 +339,7 @@ export default function VoiceAgent() {
 
       if (room && roomRef.current === room) {
         roomRef.current = null;
+        boundSessionId.current = null;
         await room.disconnect();
       }
       clearRemoteAudio();
@@ -298,7 +351,9 @@ export default function VoiceAgent() {
     attachRemoteAudio,
     clearRemoteAudio,
     detachRemoteAudio,
+    publishVoiceTripUpdate,
     resetVoiceState,
+    sessionId,
     voiceStatus,
   ]);
 
@@ -336,10 +391,21 @@ export default function VoiceAgent() {
   }, [hasMicrophoneTrack, isMicrophoneMuted, voiceStatus]);
 
   useEffect(() => {
+    if (
+      roomRef.current &&
+      boundSessionId.current &&
+      boundSessionId.current !== sessionId
+    ) {
+      void stopVoiceSession();
+    }
+  }, [sessionId, stopVoiceSession]);
+
+  useEffect(() => {
     return () => {
       connectionAttempt.current += 1;
       const room = roomRef.current;
       roomRef.current = null;
+      boundSessionId.current = null;
       clearRemoteAudio();
       void room?.disconnect();
     };
@@ -360,7 +426,9 @@ export default function VoiceAgent() {
               ? "Microphone muted"
               : voiceStatus === "connected"
                 ? "Plan A is listening"
-                : "Talk to Plan A";
+                : sessionId
+                  ? "Talk to Plan A about this trip"
+                  : "Start a trip before using voice edits";
 
   return (
     <aside

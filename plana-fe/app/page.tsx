@@ -6,6 +6,7 @@ import {
   MapPin, Clock, Train, HelpCircle, AlertTriangle, 
   CheckCircle, ArrowRight, ShieldCheck, RefreshCw, Eye
 } from "lucide-react";
+import { useTripSession } from "./trip-session-context";
 
 interface Message {
   type: "human" | "ai";
@@ -88,9 +89,23 @@ interface TripState {
   messages?: Message[];
 }
 
+async function fetchTripSessionState(sessionId: string): Promise<TripState> {
+  const response = await fetch(
+    `http://localhost:8000/api/trips/${encodeURIComponent(sessionId)}`,
+  );
+  if (!response.ok) {
+    throw new Error("Could not load the current trip.");
+  }
+  return (await response.json()) as TripState;
+}
+
 export default function Home() {
+  const {
+    sessionId: tripId,
+    setSessionId: setTripId,
+    voiceTripUpdate,
+  } = useTripSession();
   const [inputText, setInputText] = useState("");
-  const [tripId, setTripId] = useState("");
   const [messages, setMessages] = useState<Message[]>([
     { type: "ai", content: "Hi! I am ROAM. Where are we heading? Tell me your destination, dates, preferences, and hotel budget." }
   ]);
@@ -100,6 +115,7 @@ export default function Home() {
   const [isPlanning, setIsPlanning] = useState(false);
   const [currentStep, setCurrentStep] = useState<string | null>(null);
   const [pastTrips, setPastTrips] = useState<any[]>([]);
+  const [voiceUpdateSummary, setVoiceUpdateSummary] = useState<string | null>(null);
   
   // Track visualizer states
   const [planningSteps, setPlanningSteps] = useState({
@@ -146,22 +162,63 @@ export default function Home() {
 
   const loadExistingTrip = async (id: string) => {
     try {
-      const response = await fetch(`http://localhost:8000/api/trips/${id}`);
-      if (response.ok) {
-        const state = await response.json();
-        setTripState(state);
-        if (state.messages && state.messages.length > 0) {
-          setMessages(state.messages);
-        } else {
-          setMessages([
-            { type: "ai", content: "Hi! I am ROAM. Where are we heading? Tell me your destination, dates, preferences, and hotel budget." }
-          ]);
-        }
+      const state = await fetchTripSessionState(id);
+      setTripState(state);
+      if (state.messages && state.messages.length > 0) {
+        setMessages(state.messages);
+      } else {
+        setMessages([
+          { type: "ai", content: "Hi! I am ROAM. Where are we heading? Tell me your destination, dates, preferences, and hotel budget." }
+        ]);
       }
     } catch (e) {
       console.error("Error loading existing trip:", e);
     }
   };
+
+  // The voice worker publishes this only after the backend has saved and
+  // validated the edit. Updating the same state that drives the calendar makes
+  // the itinerary change visible immediately without exposing Supabase to the
+  // browser or waiting for a polling interval.
+  useEffect(() => {
+    if (!voiceTripUpdate || voiceTripUpdate.sessionId !== tripId) {
+      return;
+    }
+
+    let cancelled = false;
+    let timeoutId: number | undefined;
+    const showVoiceUpdate = (summary: string) => {
+      if (cancelled) {
+        return;
+      }
+      setVoiceUpdateSummary(summary);
+      timeoutId = window.setTimeout(() => setVoiceUpdateSummary(null), 5000);
+    };
+
+    // This is a state-only refresh. It deliberately does not change the shared
+    // session ID, so VoiceAgent keeps the current LiveKit room connected.
+    void fetchTripSessionState(tripId)
+      .then((state) => {
+        if (cancelled) {
+          return;
+        }
+        setTripState(state);
+        showVoiceUpdate(voiceTripUpdate.summary);
+      })
+      .catch((error) => {
+        console.error("Could not refresh the itinerary after a voice edit:", error);
+        showVoiceUpdate(
+          `${voiceTripUpdate.summary} The change is saved, but this page could not refresh yet.`,
+        );
+      });
+
+    return () => {
+      cancelled = true;
+      if (timeoutId !== undefined) {
+        window.clearTimeout(timeoutId);
+      }
+    };
+  }, [tripId, voiceTripUpdate]);
 
   const handleNewTrip = () => {
     setTripId("");
@@ -179,7 +236,7 @@ export default function Home() {
     setTripId(id);
     loadExistingTrip(id);
     if (typeof window !== "undefined") {
-      window.history.pushState({}, '', `?trip_id=${id}`);
+      window.history.pushState({}, '', `?trip_id=${encodeURIComponent(id)}`);
     }
   };
 
@@ -203,7 +260,7 @@ export default function Home() {
       replan: "idle"
     });
 
-    const activeId = tripId || `trip_${Math.floor(Math.random() * 1000000)}`;
+    const activeId = tripId || `trip_${crypto.randomUUID()}`;
     setTripId(activeId);
 
     try {
@@ -467,6 +524,15 @@ export default function Home() {
 
   return (
     <div className="min-h-screen bg-black text-zinc-100 font-sans flex flex-col antialiased">
+      {voiceUpdateSummary && (
+        <div
+          className="fixed bottom-24 right-6 z-40 max-w-sm rounded-xl border border-emerald-500/30 bg-emerald-950/95 px-4 py-3 text-sm text-emerald-100 shadow-xl shadow-black/30"
+          role="status"
+        >
+          <span className="mr-2 font-semibold text-emerald-300">Plan A updated the itinerary:</span>
+          {voiceUpdateSummary}
+        </div>
+      )}
       {/* Navigation header */}
       <header className="border-b border-zinc-800/80 bg-zinc-950/60 backdrop-blur-md px-6 py-4 flex items-center justify-between sticky top-0 z-50">
         <div className="flex items-center gap-3">
@@ -481,7 +547,7 @@ export default function Home() {
         <div className="flex items-center gap-4 text-xs">
           {tripId && (
             <span className="bg-zinc-850 px-2.5 py-1 rounded-full text-zinc-300 border border-zinc-800">
-              Trip ID: <span className="font-mono text-pink-400">{tripId}</span>
+              Session ID: <span className="font-mono text-pink-400">{tripId}</span>
             </span>
           )}
           <span className="bg-zinc-900 px-3 py-1 rounded text-zinc-400 border border-zinc-800 flex items-center gap-1">
@@ -508,26 +574,33 @@ export default function Home() {
             {pastTrips.length === 0 ? (
               <span className="text-xs text-zinc-600 px-2 block italic">No history yet</span>
             ) : (
-              pastTrips.map((trip) => (
-                <button
-                  key={trip.id}
-                  onClick={() => handleSelectPastTrip(trip.id)}
-                  className={`w-full text-left p-2.5 rounded-lg border text-xs transition duration-150 block ${
-                    tripId === trip.id
-                      ? "bg-indigo-600/10 border-indigo-500/50 text-indigo-300"
-                      : "bg-zinc-900/40 border-zinc-800/60 text-zinc-400 hover:bg-zinc-900 hover:text-zinc-200"
-                  }`}
-                >
-                  <div className="font-semibold truncate">
-                    {trip.state_json?.destination || `New Trip (${trip.phone_number || "Draft"})`}
-                  </div>
-                  {trip.state_json?.start_date && (
-                    <div className="text-[10px] text-zinc-500 truncate mt-0.5">
-                      {trip.state_json.start_date} to {trip.state_json.end_date}
+              pastTrips.map((trip) => {
+                // `phone_number` is the stable conversation/session key in the
+                // existing backend. `trip.id` is a separate DB record id and
+                // cannot bind a LiveKit voice room to this itinerary.
+                const sessionId = trip.phone_number as string | undefined;
+                return (
+                  <button
+                    key={trip.id}
+                    disabled={!sessionId}
+                    onClick={() => sessionId && handleSelectPastTrip(sessionId)}
+                    className={`w-full text-left p-2.5 rounded-lg border text-xs transition duration-150 block disabled:cursor-not-allowed disabled:opacity-50 ${
+                      tripId === sessionId
+                        ? "bg-indigo-600/10 border-indigo-500/50 text-indigo-300"
+                        : "bg-zinc-900/40 border-zinc-800/60 text-zinc-400 hover:bg-zinc-900 hover:text-zinc-200"
+                    }`}
+                  >
+                    <div className="font-semibold truncate">
+                      {trip.state_json?.destination || `New Trip (${sessionId || "Draft"})`}
                     </div>
-                  )}
-                </button>
-              ))
+                    {trip.state_json?.start_date && (
+                      <div className="text-[10px] text-zinc-500 truncate mt-0.5">
+                        {trip.state_json.start_date} to {trip.state_json.end_date}
+                      </div>
+                    )}
+                  </button>
+                );
+              })
             )}
           </div>
         </div>
@@ -721,8 +794,11 @@ export default function Home() {
                     <div className="space-y-4 relative border-l-2 border-zinc-800/80 ml-3.5 pl-6 py-2">
                       {tripState.itinerary.days
                         .find(d => d.day_number === activeDay)
-                        ?.events.map((event, idx) => (
-                          <div key={idx} className="relative">
+                        ?.events.map((event) => (
+                          <div
+                            key={`${event.name}-${event.start_time}-${event.end_time}`}
+                            className="relative transition-all duration-500"
+                          >
                             
                             {/* Bullet icon representing event category */}
                             <span className={`absolute -left-[35px] top-1.5 w-6 h-6 rounded-full flex items-center justify-center text-[10px] border shadow ${

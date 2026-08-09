@@ -1,4 +1,5 @@
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -24,12 +25,41 @@ from database import (
     get_all_trips
 )
 from sms_formatter import SMSFormatter
+from voice_itinerary import (
+    VoiceItineraryConflictError,
+    VoiceItineraryEdit,
+    VoiceTripNotFoundError,
+    get_voice_trip_context,
+    reschedule_voice_itinerary_event,
+)
 import httpx
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="ROAM API Engine")
+
+
+def require_voice_agent_auth(request: Request) -> None:
+    """Authorize calls made by the separately deployed LiveKit worker.
+
+    Supabase credentials remain in this backend. The worker receives only this
+    short server-to-server credential, which must never be sent to the browser.
+    """
+    expected_secret = os.getenv("PLANA_VOICE_AGENT_SECRET")
+    if not expected_secret:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="PLANA_VOICE_AGENT_SECRET is not configured.",
+        )
+
+    authorization = request.headers.get("Authorization", "")
+    provided_secret = authorization.removeprefix("Bearer ").strip()
+    if not provided_secret or not hmac.compare_digest(provided_secret, expected_secret):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid voice-agent credentials.",
+        )
 
 # Enable CORS for Next.js frontend
 app.add_middleware(
@@ -383,6 +413,32 @@ async def get_trip_endpoint(trip_id: str):
     response_data = dict(trip["state_json"])
     response_data["messages"] = messages
     return response_data
+
+
+@app.get("/api/internal/voice/trips/{session_id}/context")
+async def get_voice_trip_context_endpoint(session_id: str, request: Request):
+    """Return the current server-side trip context to the dispatched voice worker."""
+    require_voice_agent_auth(request)
+    try:
+        return await get_voice_trip_context(session_id)
+    except VoiceTripNotFoundError as error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
+
+
+@app.post("/api/internal/voice/trips/{session_id}/itinerary-edits")
+async def reschedule_voice_itinerary_event_endpoint(
+    session_id: str,
+    edit: VoiceItineraryEdit,
+    request: Request,
+):
+    """Persist one validated itinerary edit requested through the voice agent."""
+    require_voice_agent_auth(request)
+    try:
+        return await reschedule_voice_itinerary_event(session_id, edit)
+    except VoiceTripNotFoundError as error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
+    except VoiceItineraryConflictError as error:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
 
 def main() -> None:
     port = int(os.getenv("PORT", 8000))
