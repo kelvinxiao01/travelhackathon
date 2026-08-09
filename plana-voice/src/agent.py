@@ -2,8 +2,8 @@ import os
 import textwrap
 
 from dotenv import load_dotenv
-from livekit.agents import Agent, AgentServer, AgentSession, JobContext, cli
-from livekit.plugins import google
+from livekit.agents import Agent, AgentServer, AgentSession, JobContext, cli, room_io
+from livekit.plugins import ai_coustics, google
 
 # Keep local development credentials out of source control. Values already supplied
 # by the deployment environment take precedence over either file.
@@ -43,6 +43,15 @@ def create_gemini_live_model() -> google.realtime.RealtimeModel:
     )
 
 
+def create_audio_input_options() -> room_io.AudioInputOptions:
+    """Isolate the primary speaker before their audio reaches Gemini Live."""
+    return room_io.AudioInputOptions(
+        noise_cancellation=ai_coustics.audio_enhancement(
+            model=ai_coustics.EnhancerModel.QUAIL_VF_S,
+        )
+    )
+
+
 class Assistant(Agent):
     def __init__(self) -> None:
         super().__init__(instructions=VOICE_INSTRUCTIONS)
@@ -56,10 +65,17 @@ async def my_agent(ctx: JobContext) -> None:
     ctx.log_context_fields = {"room": ctx.room.name}
 
     # Gemini Live handles audio input, audio output, and turn detection directly.
-    # No LiveKit Inference STT, LLM, or TTS models are used in this session.
+    # LiveKit Cloud applies QUAIL_VF_S to the incoming user track before it reaches
+    # Gemini, so nearby voices and environmental noise do not interfere with turns.
     session = AgentSession(llm=create_gemini_live_model())
 
-    await session.start(agent=Assistant(), room=ctx.room)
+    await session.start(
+        agent=Assistant(),
+        room=ctx.room,
+        room_options=room_io.RoomOptions(
+            audio_input=create_audio_input_options(),
+        ),
+    )
     await ctx.connect()
     await session.generate_reply(
         instructions="Greet the user briefly and invite them to start planning a trip."

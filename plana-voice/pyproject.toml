@@ -10,6 +10,7 @@ requires-python = ">=3.10, <3.15"
 
 dependencies = [
     "livekit-agents[google]>=1.6.1",
+    "livekit-plugins-ai-coustics>=0.3.0",
     "python-dotenv",
 ]
 

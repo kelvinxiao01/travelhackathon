@@ -71,6 +71,15 @@ Copy `.env.example` to `.env.local` and set all of the following values:
 When deploying the worker, configure `GOOGLE_API_KEY` as a worker secret alongside
 the LiveKit credentials.
 
+### Voice isolation
+
+The worker applies ai-coustics Voice Focus 2.1 S (`QUAIL_VF_S`) to incoming browser
+audio through LiveKit Cloud before it reaches Gemini Live. It is designed to keep a
+dominant, near-field speaker clear when nearby voices or environmental noise are
+present. No additional ai-coustics key is needed with LiveKit Cloud, but Voice Focus
+has an additional LiveKit usage cost. Do not add a second enhanced noise-cancellation
+model in the browser; LiveKit recommends filtering the audio in only one place.
+
 Create a project from this template with the LiveKit CLI (recommended):
 
 ```bash

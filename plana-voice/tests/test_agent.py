@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from unittest.mock import sentinel
 
 import pytest
@@ -41,6 +42,41 @@ def test_gemini_live_model_requires_a_google_api_key(
 
     with pytest.raises(RuntimeError, match="GOOGLE_API_KEY"):
         agent.create_gemini_live_model()
+
+
+def test_voice_input_uses_the_quail_voice_focus_small_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_enhancement: dict[str, object] = {}
+    captured_options: dict[str, object] = {}
+
+    def fake_audio_enhancement(**kwargs: object) -> object:
+        captured_enhancement.update(kwargs)
+        return sentinel.noise_cancellation
+
+    def fake_audio_input_options(**kwargs: object) -> object:
+        captured_options.update(kwargs)
+        return sentinel.audio_input_options
+
+    monkeypatch.setattr(
+        agent,
+        "ai_coustics",
+        SimpleNamespace(
+            EnhancerModel=SimpleNamespace(QUAIL_VF_S=sentinel.quail_vf_s),
+            audio_enhancement=fake_audio_enhancement,
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        agent,
+        "room_io",
+        SimpleNamespace(AudioInputOptions=fake_audio_input_options),
+        raising=False,
+    )
+
+    assert agent.create_audio_input_options() is sentinel.audio_input_options
+    assert captured_enhancement == {"model": sentinel.quail_vf_s}
+    assert captured_options == {"noise_cancellation": sentinel.noise_cancellation}
 
 
 def test_plan_a_voice_instructions_are_short_and_conversational() -> None:
