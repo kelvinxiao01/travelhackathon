@@ -6,8 +6,7 @@ and logs safe metadata; it does not create an agent or send replies.
 ## Run locally
 
 ```bash
-uv sync
-uv run uvicorn main:app --host 0.0.0.0 --port 8000
+uv run main.py
 ```
 
 In another terminal, confirm the service is available:

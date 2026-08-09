@@ -4,6 +4,7 @@ import json
 import logging
 from typing import Any
 
+import uvicorn
 from fastapi import FastAPI, HTTPException, Request, status
 
 
@@ -62,3 +63,12 @@ async def receive_telnyx_message(request: Request) -> dict[str, str]:
     )
 
     return {"status": "accepted"}
+
+
+def main() -> None:
+    """Start the local webhook server."""
+    uvicorn.run("main:app", host="0.0.0.0", port=8000)
+
+
+if __name__ == "__main__":
+    main()
